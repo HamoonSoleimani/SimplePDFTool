@@ -3309,11 +3309,20 @@ class AdvancedPdfToolkit:
     def _create_page_range_field(self, parent: ttk.Frame, variable: tk.StringVar,
                                 label: str="Page Range (optional):") -> Tuple[ttk.Frame, ttk.Entry]:
         """Helper to create a page range input field with help text."""
+        # Use the helper to create the main row (label + entry)
+        # Assuming the default label_width in _create_widget_row is around 20
         frame, entry = self._create_widget_row(parent, label, variable, 'entry', widget_options={'width': 30})
-        # Add help text below the row frame
+
+        # Add help text below the row frame, packed directly into the parent frame
         help_label = ttk.Label(parent, text="e.g., 1, 3, 5-7, 10- (blank = all)", style='Subtitle.TLabel')
-        help_label.pack(anchor=tk.W, padx=(self.style.lookup('TLabel', 'width', ('width', 1)) * 7 + 10), pady=(0,5)) # Adjust indent dynamically? Hardcoded for now.
-        return frame, entry
+
+        # --- MODIFIED LINE ---
+        # Use a fixed pixel indent instead of the complex style lookup
+        fixed_indent = 150 # Adjust this value as needed for visual alignment
+        help_label.pack(anchor=tk.W, padx=(fixed_indent, 0), pady=(0, 5))
+        # --- END MODIFIED LINE ---
+
+        return frame, entry # Return the original row frame and entry widget
 
     def _create_action_button(self, parent: ttk.Frame, text: str, command: Callable, style: str = 'primary') -> ttk.Button:
         """Helper to create the main action button for a page, centered."""
@@ -3367,13 +3376,18 @@ class AdvancedPdfToolkit:
         def _update_split_options_visibility(*args):
             method = self.split_method.get()
             is_ranges = (method == "ranges")
+            # Define the fixed indent here as well
+            fixed_indent = 150 # Use the same value as in _create_page_range_field
+
             # Show/hide the entire row frame for ranges
             if is_ranges:
                 self.split_ranges_row.pack(fill=tk.X, pady=2) # Show the row
                 # Find the help label associated with ranges and show it
                 for child in options_frame.winfo_children():
                      if isinstance(child, ttk.Label) and "e.g., 1, 3, 5-7" in child.cget("text"):
-                         child.pack(anchor=tk.W, padx=(self.style.lookup('TLabel', 'width', ('width', 1)) * 7 + 10), pady=(0,5))
+                         # --- MODIFIED LINE ---
+                         child.pack(anchor=tk.W, padx=(fixed_indent, 0), pady=(0,5)) # Use fixed indent
+                         # --- END MODIFIED LINE ---
                          break
             else:
                 self.split_ranges_row.pack_forget() # Hide the row
@@ -3382,6 +3396,7 @@ class AdvancedPdfToolkit:
                      if isinstance(child, ttk.Label) and "e.g., 1, 3, 5-7" in child.cget("text"):
                          child.pack_forget()
                          break
+
 
         self.split_method.trace_add("write", _update_split_options_visibility)
         _update_split_options_visibility() # Initial setup
