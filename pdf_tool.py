@@ -1274,7 +1274,8 @@ class PDFToImagesOperation(PDFOperation):
                             img.close()
                             pix_rgb = None # Release memory
                         elif self.fitz_format == "png":
-                             pix.save(output_path, output_format='png') # Use built-in save
+                            pix.save(output_path) # Save using filename extension
+
                         else:
                             # For other formats, convert Pixmap to PIL Image and save
                             mode = "RGB" if pix.colorspace == fitz.csRGB else "L" if pix.colorspace == fitz.csGRAY else "RGBA" # Basic mode detection
@@ -3940,11 +3941,26 @@ class AdvancedPdfToolkit:
             # Apply the determined theme using ttkbootstrap's method
             logger.debug(f"Setting ttkbootstrap theme to: {ttk_theme_name}")
             self.style.theme_use(ttk_theme_name)
-            self.is_dark_mode.set(self.style.is_dark_theme) # Use ttkb's check
+
+            # --- MODIFIED PART ---
+            # Determine dark mode based on actual background color brightness
+            try:
+                bg_color = self.style.lookup('TFrame', 'background')
+                rgb = self.root.winfo_rgb(bg_color)
+                # Calculate perceived brightness (simple average)
+                brightness = sum(rgb) / 3 / 65535 # winfo_rgb gives 0-65535 range
+                is_dark = brightness < 0.5 # Threshold for darkness
+                self.is_dark_mode.set(is_dark)
+                logger.debug(f"Determined dark mode: {is_dark} (bg: {bg_color}, brightness: {brightness:.3f})")
+            except tk.TclError:
+                logger.warning("Could not determine theme brightness for dark mode check. Defaulting to False.")
+                self.is_dark_mode.set(False)
+            # --- END MODIFIED PART ---
 
             # Update elements not automatically themed (like status bar)
             self._update_status_bar_style()
             # Update sidebar style maybe?
+            # Determine sidebar style based on the calculated is_dark_mode
             sidebar_style = 'primary.TFrame' if self.is_dark_mode.get() else 'secondary.TFrame' # Example
             self.sidebar_frame.config(style=sidebar_style)
 
