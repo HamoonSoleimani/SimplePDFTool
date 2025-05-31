@@ -5082,9 +5082,8 @@ class AdvancedPdfToolkit:
         - pypdf
         - Pillow (PIL)
 
-        Developed by: [Your Name/Alias Here]
+        Developed by: Hamoon Soleimani
 
-        (License info placeholder - e.g., MIT License)
         """
         messagebox.showinfo(f"About {APP_NAME}", about_text, parent=self.root)
 
