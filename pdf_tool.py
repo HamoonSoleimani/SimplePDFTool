@@ -2385,10 +2385,12 @@ class OperationManager:
                         # Check if the listener is a GUI object with our safe update method
                         if hasattr(listener, 'safe_ui_update') and callable(getattr(listener, 'safe_ui_update')):
                             # Schedule the actual notification via the listener's safe_ui_update method
-                            listener.safe_ui_update(callback, operation, *args, **kwargs)
+                            # FIX: Pass *args directly, don't add the non-existent 'operation' variable.
+                            listener.safe_ui_update(callback, *args, **kwargs)
                         else:
                             # For non-GUI listeners or those without the method, call directly
-                            callback(operation, *args, **kwargs)
+                            # FIX: Pass *args directly, don't add the non-existent 'operation' variable.
+                            callback(*args, **kwargs)
                     except Exception as e:
                         logger.error(f"Error notifying listener {listener}.{method_name}: {e}")
 
@@ -2474,17 +2476,20 @@ class OperationManager:
 
     def on_progress_update(self, operation: PDFOperation, progress: float, status_message: str, level: str):
         if operation == self.current_operation: # Ensure update is from current op
-            self._notify_listeners("on_progress_update", progress, status_message, level)
-
+            # FIX: Pass the 'operation' object as the first argument to the listeners.
+            self._notify_listeners("on_progress_update", operation, progress, status_message, level)
 
     def on_status_update(self, operation: PDFOperation, message: str, level: str):
         if operation == self.current_operation:
-            self._notify_listeners("on_status_update", message, level)
+            # FIX: Pass the 'operation' object as the first argument to the listeners.
+            self._notify_listeners("on_status_update", operation, message, level)
 
     def on_operation_complete(self, operation: PDFOperation, success: bool, message: str, level: str):
          # This notification comes *from* the operation upon its completion.
          # The _run_operation_thread handles the manager's final state cleanup.
-        self._notify_listeners("on_operation_complete", success, message, level)
+        # FIX: Pass the 'operation' object as the first argument to the listeners.
+        self._notify_listeners("on_operation_complete", operation, success, message, level)
+
 
 
 
@@ -3398,7 +3403,7 @@ class AdvancedPdfToolkit:
             widget.pack(side=tk.LEFT, fill=tk.X, expand=True)
             # Add tooltip if provided (requires external library or simple event binding)
             if tooltip:
-                 self.add_tooltip(widget, tooltip)
+                AdvancedPdfToolkit.add_tooltip(widget, tooltip)
 
         if button_text and button_cmd:
              # Use outline style for secondary buttons
@@ -3550,14 +3555,14 @@ class AdvancedPdfToolkit:
         r2.pack(side=tk.LEFT, padx=5)
         r3 = ttk.Radiobutton(method_frame, text="By Bookmarks", variable=self.split_method, value="bookmarks")
         r3.pack(side=tk.LEFT, padx=5)
-        self.add_tooltip(r3, "Splits based on top-level bookmarks in the PDF.")
+        AdvancedPdfToolkit.add_tooltip(r3, "Splits based on top-level bookmarks in the PDF.")
 
         # Page Ranges Entry (conditionally visible)
         self.split_ranges_row, self.split_ranges_entry = self._create_page_range_field(options_frame, self.split_ranges, label="Page Ranges:")
 
         # Output Prefix
         _, self.split_prefix_entry = self._create_widget_row(options_frame, "Output Prefix:", self.split_prefix, 'entry', widget_options={'width': 30})
-        self.add_tooltip(self.split_prefix_entry, "Optional prefix for output filenames (e.g., 'Chapter_'). Defaults to input filename.")
+        AdvancedPdfToolkit.add_tooltip(self.split_prefix_entry, "Optional prefix for output filenames (e.g., 'Chapter_'). Defaults to input filename.")
 
         # --- Visibility Logic ---
         def _update_split_options_visibility(*args):
@@ -3616,7 +3621,7 @@ class AdvancedPdfToolkit:
         merge_scrollbar.grid(row=1, column=2, sticky='ns')
         self.merge_listbox.config(yscrollcommand=merge_scrollbar.set)
         # Add drag-and-drop reordering later if desired (requires more complex binding)
-        self.add_tooltip(self.merge_listbox, "Add PDF files. Select items and use buttons to reorder or remove. Drag-and-drop not yet implemented.")
+        AdvancedPdfToolkit.add_tooltip(self.merge_listbox, "Add PDF files. Select items and use buttons to reorder or remove. Drag-and-drop not yet implemented.")
 
         # List Manipulation Buttons Frame
         list_btn_frame = ttk.Frame(left_frame)
@@ -3627,7 +3632,7 @@ class AdvancedPdfToolkit:
         ttk.Button(list_btn_frame, text="Up", command=lambda: self.move_merge_item(-1), style='Outline.TButton').pack(side=tk.LEFT, padx=2)
         ttk.Button(list_btn_frame, text="Down", command=lambda: self.move_merge_item(1), style='Outline.TButton').pack(side=tk.LEFT, padx=2)
         ttk.Button(list_btn_frame, text="Password...", command=self.set_merge_password, style='Outline.TButton').pack(side=tk.LEFT, padx=2)
-        self.add_tooltip(list_btn_frame.winfo_children()[-1], "Set password for the selected encrypted PDF in the list.")
+        AdvancedPdfToolkit.add_tooltip(list_btn_frame.winfo_children()[-1], "Set password for the selected encrypted PDF in the list.")
         ttk.Button(list_btn_frame, text="Clear", command=self.clear_merge_list, style='Outline.Danger.TButton').pack(side=tk.LEFT, padx=2)
 
 
@@ -3652,7 +3657,7 @@ class AdvancedPdfToolkit:
         combo = ttk.Combobox(bm_frame, textvariable=self.merge_bookmark_template,
                              values=["FILENAME", "INDEX_FILENAME"], state='readonly', width=18)
         combo.pack(side=tk.LEFT, padx=5)
-        self.add_tooltip(combo, "Choose bookmark format:\nFILENAME: Use original filename.\nINDEX_FILENAME: Add number before filename.")
+        AdvancedPdfToolkit.add_tooltip(combo, "Choose bookmark format:\nFILENAME: Use original filename.\nINDEX_FILENAME: Add number before filename.")
         # Enable/disable combobox based on checkbox
         def _toggle_bookmark_combo(*args):
             combo.config(state=tk.NORMAL if self.merge_add_bookmarks.get() else tk.DISABLED)
@@ -3684,7 +3689,7 @@ class AdvancedPdfToolkit:
         img_scrollbar = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.img2pdf_listbox.yview, style='Vertical.TScrollbar')
         img_scrollbar.grid(row=1, column=2, sticky='ns')
         self.img2pdf_listbox.config(yscrollcommand=img_scrollbar.set)
-        self.add_tooltip(self.img2pdf_listbox, "Add image files. Order determines page order in the PDF.")
+        AdvancedPdfToolkit.add_tooltip(self.img2pdf_listbox, "Add image files. Order determines page order in the PDF.")
 
         # List Buttons
         list_btn_frame = ttk.Frame(left_frame)
@@ -3780,11 +3785,11 @@ class AdvancedPdfToolkit:
         img_options_frame = ttk.Frame(options_frame)
         img_options_frame.pack(fill=tk.X, pady=(5,0))
         cb_frame, cb = self._create_widget_row(img_options_frame, "Downsample Images:", self.compress_downsample, 'checkbutton')
-        self.add_tooltip(cb_frame, "Reduces the resolution of images within the PDF to save space.")
+        AdvancedPdfToolkit.add_tooltip(cb_frame, "Reduces the resolution of images within the PDF to save space.")
 
         self.compress_dpi_frame, self.compress_dpi_spinbox = self._create_widget_row(options_frame, "  Target Image DPI:", self.compress_image_dpi, 'spinbox',
                                         widget_options={'from_': 72, 'to': 600, 'increment': 1, 'width': 10})
-        self.add_tooltip(self.compress_dpi_spinbox, "Images above this resolution will be downsampled.")
+        AdvancedPdfToolkit.add_tooltip(self.compress_dpi_spinbox, "Images above this resolution will be downsampled.")
 
         # Bind visibility of DPI entry to checkbox
         def _update_compress_dpi_visibility(*args):
@@ -3825,9 +3830,9 @@ class AdvancedPdfToolkit:
 
         # Passwords
         self._create_password_field(self.encrypt_options_frame, self.encrypt_user_password, label="User Password:")
-        self.add_tooltip(self.encrypt_options_frame.winfo_children()[-1], "Password required to open the PDF. Leave blank for no user password (only owner).")
+        AdvancedPdfToolkit.add_tooltip(self.encrypt_options_frame.winfo_children()[-1], "Password required to open the PDF. Leave blank for no user password (only owner).")
         self._create_password_field(self.encrypt_options_frame, self.encrypt_owner_password, label="Owner Password:")
-        self.add_tooltip(self.encrypt_options_frame.winfo_children()[-1], "Password required to change permissions or remove encryption.\nIf blank, uses the User Password.")
+        AdvancedPdfToolkit.add_tooltip(self.encrypt_options_frame.winfo_children()[-1], "Password required to change permissions or remove encryption.\nIf blank, uses the User Password.")
 
         # Encryption Level
         self._create_widget_row(self.encrypt_options_frame, "Encryption Level:", self.encrypt_level, 'combobox',
@@ -3845,7 +3850,7 @@ class AdvancedPdfToolkit:
         cb2.grid(row=1, column=0, sticky='w', pady=1)
         cb3 = ttk.Checkbutton(perm_frame, variable=self.encrypt_allow_modifying, text="Allow Modifying Document")
         cb3.grid(row=0, column=1, sticky='w', pady=1)
-        self.add_tooltip(cb3, "Allows assembly, form filling, commenting, but not content changes.")
+        AdvancedPdfToolkit.add_tooltip(cb3, "Allows assembly, form filling, commenting, but not content changes.")
         cb4 = ttk.Checkbutton(perm_frame, variable=self.encrypt_allow_annotating, text="Allow Annotating/Forms")
         cb4.grid(row=1, column=1, sticky='w', pady=1)
         # Add tooltips to permissions if needed
@@ -3934,7 +3939,7 @@ class AdvancedPdfToolkit:
         if entry: entry.configure(style='PathEntry.TEntry')
         # Add Load Metadata button to the same row
         ttk.Button(input_frame, text="Load Current", command=self.load_pdf_metadata, style='Outline.TButton').pack(side=tk.LEFT, padx=(5,0))
-        self.add_tooltip(input_frame.winfo_children()[-1], "Load existing metadata from the selected PDF.")
+        AdvancedPdfToolkit.add_tooltip(input_frame.winfo_children()[-1], "Load existing metadata from the selected PDF.")
 
 
         # Output Row
@@ -3952,11 +3957,11 @@ class AdvancedPdfToolkit:
         self._create_widget_row(fields_frame, "Author:", self.metadata_author, 'entry')
         self._create_widget_row(fields_frame, "Subject:", self.metadata_subject, 'entry')
         self._create_widget_row(fields_frame, "Keywords:", self.metadata_keywords, 'entry')
-        self.add_tooltip(fields_frame.winfo_children()[-1].widget, "Comma-separated keywords.")
+        AdvancedPdfToolkit.add_tooltip(fields_frame.winfo_children()[-1].widget, "Comma-separated keywords.")
         self._create_widget_row(fields_frame, "Creator Tool:", self.metadata_creator, 'entry')
-        self.add_tooltip(fields_frame.winfo_children()[-1].widget, "The software that created the original document.")
+        AdvancedPdfToolkit.add_tooltip(fields_frame.winfo_children()[-1].widget, "The software that created the original document.")
         self._create_widget_row(fields_frame, "PDF Producer:", self.metadata_producer, 'entry')
-        self.add_tooltip(fields_frame.winfo_children()[-1].widget, "The software that created this PDF file.")
+        AdvancedPdfToolkit.add_tooltip(fields_frame.winfo_children()[-1].widget, "The software that created this PDF file.")
 
         # Action Button
         self._create_action_button(parent, "Update PDF Metadata", self.run_edit_metadata)
@@ -3972,7 +3977,7 @@ class AdvancedPdfToolkit:
         # Use ttkbootstrap Label for potential style integration
         self.status_label = ttb.Label(self.status_bar_frame, textvariable=self.status_message, anchor=tk.W, bootstyle='default') # Use bootstyle
         self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5, pady=2)
-        self.add_tooltip(self.status_label, "Displays current status and messages. Click to view log history.")
+        AdvancedPdfToolkit.add_tooltip(self.status_label, "Displays current status and messages. Click to view log history.")
         self.status_label.bind("<Button-1>", lambda e: self.show_log_viewer())
 
         # Progress Bar (hidden initially)
@@ -4238,7 +4243,8 @@ class AdvancedPdfToolkit:
                 else:
                     raise # Re-raise other TclErrors
                     
-    def add_tooltip(self, widget: tk.Widget, text: str):
+    @staticmethod
+    def add_tooltip(widget: tk.Widget, text: str): # <-- ADD @staticmethod and REMOVE self
         """Basic tooltip implementation (can be replaced with a library)."""
         tooltip_label = None
         enter_time = None
@@ -5649,9 +5655,10 @@ class LogViewerDialog(tk.Toplevel):
     """A non-modal dialog to display application status/log history."""
     def __init__(self, parent: tk.Widget, log_history: List[Tuple[str, str, str]]):
         super().__init__(parent)
+        self.parent = parent  # <-- ADD THIS LINE
         self.title("Log History Viewer")
         self.geometry("750x500")
-        self.attributes('-topmost', False) # Allow interaction with main window
+
 
         # --- Text Area ---
         text_frame = ttk.Frame(self)
@@ -5782,7 +5789,7 @@ class CustomThemeDialog(CustomDialogBase):
         base_combo = ttk.Combobox(master, textvariable=self.base_theme,
                                   values=Style().theme_names(), state='readonly', width=20)
         base_combo.grid(row=row, column=1, columnspan=3, sticky=tk.EW, padx=5, pady=3)
-        AdvancedPdfToolkit.add_tooltip(None, base_combo, "Select the built-in theme to base your custom colors on.")
+        AdvancedPdfToolkit.add_tooltip(base_combo, "Select the built-in theme to base your custom colors on.")
         row += 1
 
         ttk.Separator(master, orient=tk.HORIZONTAL).grid(row=row, column=0, columnspan=4, sticky='ew', pady=10)
