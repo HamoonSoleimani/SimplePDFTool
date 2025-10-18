@@ -50,6 +50,8 @@ import re
 import shutil
 import subprocess
 import sys
+print(f"--- SCRIPT IS RUNNING WITH: {sys.executable} ---")
+
 import tempfile
 import threading
 import time
@@ -77,11 +79,27 @@ try:
 except ImportError:
     MISSING_DEPENDENCIES.append("pymupdf (required for core functionality)")
 
+PYPDF_IMPORTED = False
 try:
+    # Try pypdf (newer)
     from pypdf import PdfReader, PdfWriter, PageRange, PdfMerger
     from pypdf.errors import PdfReadError, DependencyError
+    PYPDF_IMPORTED = True
+    print("--- Using pypdf (new version) ---")
 except ImportError:
-    MISSING_DEPENDENCIES.append("pypdf (required for merging, encryption, fallback)")
+    try:
+        # Fallback to PyPDF2 (older)
+        from PyPDF2 import PdfReader, PdfWriter, PageRange, PdfMerger
+        from PyPDF2.errors import PdfReadError, DependencyError
+        PYPDF_IMPORTED = True
+        print("--- Using PyPDF2 (legacy version) ---")
+    except ImportError:
+        MISSING_DEPENDENCIES.append("pypdf or PyPDF2 (required for merging, encryption, fallback)")
+except Exception as e:
+    MISSING_DEPENDENCIES.append(f"pypdf (import error: {e})")
+
+if not PYPDF_IMPORTED:
+    logger.error("Could not import pypdf or PyPDF2")
 
 try:
     from PIL import Image, UnidentifiedImageError, ImageOps, ImageDraw, ImageFilter, ImageEnhance
@@ -298,6 +316,46 @@ class ValidationError(ValueError):
     """Custom exception for validation errors in operations."""
     pass
 
+
+class TemporaryPdfDocument:
+    """Context manager for safely handling PDF documents with cleanup."""
+    
+    def __init__(self, operation: 'PDFOperation', filepath: str):
+        self.operation = operation
+        self.filepath = filepath
+        self.doc = None
+        
+    def __enter__(self) -> fitz.Document:
+        """Open document with password handling."""
+        try:
+            self.doc = fitz.open(self.filepath)
+            if self.doc.is_encrypted:
+                password = self.operation.password
+                if not password:
+                    self.doc.close()
+                    raise PdfPasswordException(f"Password required for: {os.path.basename(self.filepath)}")
+                if not self.doc.authenticate(password):
+                    self.doc.close()
+                    raise PdfPasswordException(f"Incorrect password for: {os.path.basename(self.filepath)}")
+            return self.doc
+        except fitz.FileDataError as e:
+            if self.doc:
+                self.doc.close()
+            raise ValidationError(f"Invalid PDF file: {os.path.basename(self.filepath)} - {e}")
+        except Exception as e:
+            if self.doc:
+                self.doc.close()
+            raise
+            
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Ensure document is closed."""
+        if self.doc:
+            try:
+                self.doc.close()
+            except Exception as e:
+                logger.warning(f"Error closing document: {e}")
+        return False  # Don't suppress exceptions
+        
 # --- Model: Core Business Logic ---
 
 class PDFOperation:
@@ -342,6 +400,18 @@ class PDFOperation:
                 except Exception as e:
                     logger.error(f"Error notifying listener {listener}: {e}")
                     # traceback.print_exc() # Optionally log traceback
+
+    def _prompt_password_with_retry(self, filepath: str, max_retries: int = 3) -> Optional[str]:
+        """Prompt for password with retry mechanism."""
+        for attempt in range(max_retries):
+            # This needs to be implemented by the UI layer
+            # For now, we'll store the callback if registered
+            if hasattr(self, '_password_callback'):
+                password = self._password_callback(filepath, attempt)
+                if password is None:  # User cancelled
+                    return None
+                return password
+        return None
 
     def notify_progress(self, progress: float, status_message: Optional[str] = None, level: str = "info"):
         """Notify listeners of progress percentage and status message."""
@@ -434,6 +504,45 @@ class PDFOperation:
                  if os.path.abspath(in_path) == os.path.abspath(self.output_path):
                      raise ValidationError(f"Output file cannot be the same as input file: {in_path}")
 
+        if hasattr(self, 'output_path') and self.output_path:
+            self._validate_output_writable(self.output_path)
+
+    def _validate_output_writable(self, output_path: str):
+            """
+            Check if the final output location is writable before starting.
+            - Checks parent directory permissions.
+            - Checks file permissions if it already exists.
+            """
+            if not output_path:
+                raise ValidationError("Output path is not defined.")
+
+            output_dir = os.path.dirname(output_path)
+            
+            # If output_dir is empty, it means the current working directory
+            if not output_dir:
+                output_dir = os.getcwd()
+
+            # Check 1: Does the directory exist and is it a directory?
+            if not os.path.isdir(output_dir):
+                # It might not exist, which is fine, we try to create it.
+                # But if it exists and is not a directory, that's an error.
+                if os.path.exists(output_dir):
+                    raise ValidationError(f"Output location's parent exists but is not a directory: {output_dir}")
+                
+                # Directory does not exist, so we don't need to check writability yet.
+                # _validate_paths handles creation.
+
+            # Check 2: If the directory exists, is it writable?
+            if os.path.isdir(output_dir) and not os.access(output_dir, os.W_OK):
+                raise ValidationError(f"Output directory is not writable: {output_dir}")
+
+            # Check 3: If the output file itself already exists, can we write to it?
+            if os.path.exists(output_path):
+                if not os.path.isfile(output_path):
+                    raise ValidationError(f"Output path exists but is not a regular file: {output_path}")
+                if not os.access(output_path, os.W_OK):
+                    raise ValidationError(f"Output file exists and is not writable: {output_path}")
+                
     def _open_input_pdf_fitz(self) -> fitz.Document:
         """Helper to open the input PDF with fitz, handling passwords."""
         if not self.input_path:
@@ -634,56 +743,86 @@ class SplitPDFOperation(PDFOperation):
         return validated_merged
 
     def _get_bookmark_splits(self, doc: fitz.Document) -> List[Tuple[int, int, str]]:
-        """Extract split ranges based on top-level bookmarks."""
-        toc = doc.get_toc(simple=False) # Get full TOC with levels
-        if not toc:
-            self.notify_status("No bookmarks found in the document.", "warning")
-            return []
+            """
+            Extract split ranges based on top-level bookmarks.
+            Handles invalid page pointers and sanitizes titles for filenames.
+            """
+            toc = doc.get_toc(simple=False) # Get full TOC with levels
+            if not toc:
+                self.notify_status("No bookmarks found in the document.", "warning")
+                return []
 
-        splits: List[Tuple[int, int, str]] = [] # (start_page_idx, end_page_idx, title)
-        top_level_bookmarks = []
+            splits: List[Tuple[int, int, str]] = [] # (start_page_idx, end_page_idx, title)
+            top_level_bookmarks = []
 
-        # Find all top-level bookmarks (level 1)
-        for i, entry in enumerate(toc):
-            level, title, page_num, _ = entry # Use the dict structure from simple=False if needed
-            page_idx = page_num - 1
-            if page_idx < 0 or page_idx >= self.num_pages:
-                 self.notify_status(f"Skipping bookmark '{title}' pointing to invalid page {page_num}", "warning")
-                 continue
-            if level == 1:
-                 top_level_bookmarks.append({'index': i, 'title': title, 'page_idx': page_idx})
+            # Find all top-level bookmarks (level 1)
+            for i, entry in enumerate(toc):
+                # Use tuple unpacking with a wildcard to handle different toc entry lengths
+                level, title, page_num, *_ = entry 
+                page_idx = page_num - 1
+                
+                # Validate that the bookmark points to a valid page
+                if page_idx < 0 or page_idx >= self.num_pages:
+                    self.notify_status(f"Skipping bookmark '{title}' pointing to invalid page {page_num}", "warning")
+                    continue
+                    
+                if level == 1:
+                    # Ensure title is a string and not empty before stripping
+                    clean_title = title.strip() if isinstance(title, str) and title.strip() else f"Bookmark_{i+1}"
+                    top_level_bookmarks.append({
+                        'index': i, 
+                        'title': clean_title, 
+                        'page_idx': page_idx
+                    })
 
-        if not top_level_bookmarks:
-             self.notify_status("No top-level bookmarks found to split by.", "warning")
-             return []
+            if not top_level_bookmarks:
+                self.notify_status("No top-level bookmarks found to split by.", "warning")
+                return []
 
-        # Determine end page for each top-level bookmark
-        for i, bm in enumerate(top_level_bookmarks):
-            start_page = bm['page_idx']
-            end_page = self.num_pages - 1 # Default to end of doc
+            # Determine end page for each top-level bookmark
+            for i, bm in enumerate(top_level_bookmarks):
+                start_page = bm['page_idx']
+                end_page = self.num_pages - 1 # Default to end of doc
 
-            # Find the start page of the *next* top-level bookmark
-            if i + 1 < len(top_level_bookmarks):
-                next_bm_page = top_level_bookmarks[i+1]['page_idx']
-                # Ensure end page is not before start page (can happen with overlapping bookmarks)
-                if next_bm_page > start_page:
-                    end_page = next_bm_page - 1
+                # Find the start page of the *next* top-level bookmark to define the end of the current section
+                if i + 1 < len(top_level_bookmarks):
+                    next_bm_page = top_level_bookmarks[i+1]['page_idx']
+                    # Ensure end page is not before start page (can happen with overlapping bookmarks)
+                    if next_bm_page > start_page:
+                        end_page = next_bm_page - 1
 
-            # Clean title for filename
-            clean_title = re.sub(r'[\\/*?:"<>|]', '_', bm['title']) # Remove invalid filename chars
-            clean_title = re.sub(r'\s+', ' ', clean_title).strip() # Consolidate whitespace
-            clean_title = clean_title[:60] # Limit length
+                # Sanitize the title for use in a filename
+                # This calls the main app's sanitize_filename if available, otherwise a local one.
+                sanitized_title = self._sanitize_bookmark_title(bm['title'])
 
-            if start_page <= end_page: # Ensure valid range
-                 splits.append((start_page, end_page, clean_title))
-            else:
-                 self.notify_status(f"Skipping potentially empty bookmark range for '{bm['title']}' (start: {start_page+1}, end: {end_page+1})", "warning")
+                if start_page <= end_page: # Ensure valid range
+                    splits.append((start_page, end_page, sanitized_title))
+                else:
+                    # This can happen if two consecutive bookmarks point to the same page
+                    self.notify_status(f"Skipping potentially empty bookmark range for '{bm['title']}' (start: {start_page+1}, end: {end_page+1})", "warning")
 
+            if not splits:
+                self.notify_status("Could not determine valid split ranges from bookmarks.", "warning")
 
-        if not splits:
-             self.notify_status("Could not determine valid split ranges from bookmarks.", "warning")
+            return splits
 
-        return splits
+    def _sanitize_bookmark_title(self, title: str) -> str:
+        """Sanitize bookmark title for use in a filename."""
+        # This is a simplified, local version of the main app's sanitizer.
+        # If this operation had access to the main app instance, we would use that.
+        # Remove invalid filename characters
+        clean = re.sub(r'[\\/*?:"<>|]', '_', title)
+        # Consolidate multiple spaces and strip
+        clean = re.sub(r'\s+', ' ', clean).strip()
+        # Remove leading/trailing dots and underscores that can be problematic
+        clean = clean.strip('._ ')
+        # Limit length to a reasonable size for filenames
+        if len(clean) > 60:
+            clean = clean[:60].strip()
+        # Ensure the filename is not empty after sanitization
+        if not clean:
+            return "bookmark_" + str(uuid.uuid4())[:8]
+        return clean
 
     def execute(self) -> bool:
         """Execute the split operation using PyMuPDF (preferred) or pypdf."""
@@ -850,173 +989,184 @@ class MergePDFOperation(PDFOperation):
         pass # Specific validation done in base class
 
     def execute(self) -> bool:
-        """Execute the merge operation using PyMuPDF (preferred) or pypdf."""
-        total_files = len(self.input_paths)
-        files_processed = 0
-        self.total_pages_merged = 0
-        processed_file_paths = [] # Keep track of successfully processed files for outline
+            """Execute the merge operation using PyMuPDF (preferred) or pypdf."""
+            total_files = len(self.input_paths)
+            files_processed = 0
+            self.total_pages_merged = 0
+            processed_file_paths = [] # Keep track of successfully processed files for outline
 
-        self.notify_status(f"Starting merge of {total_files} file(s)...", "info")
+            self.notify_status(f"Starting merge of {total_files} file(s)...", "info")
 
-        # --- Attempt 1: PyMuPDF (fitz) ---
-        try:
-            self.notify_status("Using PyMuPDF for merging...", "info")
-            # Create the output document
-            out_doc = fitz.open()
-            bookmarks_to_add = [] # List of (level, title, page_index)
-
-            for i, input_path in enumerate(self.input_paths):
-                self.check_cancelled()
-                current_progress = (i / (total_files + 1)) * 100 # +1 for final save step
-                filename = os.path.basename(input_path)
-                self.notify_progress(current_progress, f"Processing '{filename}' [{i+1}/{total_files}]")
-
-                password = self.passwords.get(input_path)
-                doc = None # Ensure doc is closable in finally
-                try:
-                    # Open the current input PDF
-                    doc = fitz.open(input_path)
-                    if doc.is_encrypted:
-                         if not password:
-                             self.notify_status(f"'{filename}' is encrypted, password needed. Skipping.", "warning")
-                             continue # Skip this file
-                         if not doc.authenticate(password):
-                             self.notify_status(f"Incorrect password for '{filename}'. Skipping.", "warning")
-                             continue # Skip this file
-
-                    num_pages = doc.page_count
-                    if num_pages > 0:
-                        # If adding outlines, note the page number *before* inserting
-                        if self.outline_title_template:
-                            dest_page_idx = out_doc.page_count # 0-based index in output doc
-                            title = self._generate_bookmark_title(self.outline_title_template, i, filename)
-                            bookmarks_to_add.append((1, title, dest_page_idx + 1)) # fitz uses 1-based page for TOC
-
-                        # Insert the pages
-                        out_doc.insert_pdf(doc)
-                        self.total_pages_merged += num_pages
-                        files_processed += 1
-                        processed_file_paths.append(input_path) # Add to list for potential pypdf fallback outline
-                    else:
-                        self.notify_status(f"'{filename}' has no pages. Skipping.", "warning")
-
-                except fitz.FileDataError as e:
-                     self.notify_status(f"Error reading '{filename}': Invalid format? Skipping. ({e})", "warning")
-                except Exception as e:
-                     self.notify_status(f"Error processing '{filename}': {e}. Skipping.", "warning")
-                finally:
-                    if doc: doc.close()
-
-            if files_processed == 0:
-                out_doc.close() # Close the empty output doc
-                self.notify_status("No valid input PDF files could be processed.", "error")
-                return False
-
-            # Add bookmarks if requested
-            if bookmarks_to_add:
-                 self.notify_status("Adding bookmarks...", "info")
-                 out_doc.set_toc(bookmarks_to_add)
-
-            # Save the merged document
-            self.notify_progress(95, f"Saving final merged PDF ({self.total_pages_merged} pages)...")
+            # --- Attempt 1: PyMuPDF (fitz) ---
             try:
-                 out_doc.save(self.output_path, garbage=4, deflate=True, linear=True)
-            except Exception as save_err:
-                 self.notify_status(f"Error saving merged PDF: {save_err}", "error")
-                 return False
-            finally:
-                 out_doc.close()
-
-            return True # PyMuPDF method succeeded
-
-        except OperationCancelledException:
-            raise
-        except Exception as fitz_err:
-            self.notify_status(f"PyMuPDF merge failed ({fitz_err}), attempting fallback with pypdf...", "warning")
-            logger.warning(f"PyMuPDF merge failed: {fitz_err}", exc_info=False)
-
-            # --- Attempt 2: pypdf Fallback ---
-            try:
-                self.notify_status("Using pypdf for merging (fallback)...", "info")
-                merger = PdfMerger()
-                self.total_pages_merged = 0 # Reset page count for pypdf
-                files_processed = 0 # Reset count for pypdf
-                bookmark_parent = None # For hierarchical bookmarks if needed later
+                self.notify_status("Using PyMuPDF for merging...", "info")
+                # Create the output document
+                out_doc = fitz.open()
+                bookmarks_to_add = [] # List of (level, title, page_index)
 
                 for i, input_path in enumerate(self.input_paths):
                     self.check_cancelled()
-                    current_progress = (i / (total_files + 1)) * 100
+                    current_progress = (i / (total_files + 1)) * 100 # +1 for final save step
                     filename = os.path.basename(input_path)
-                    self.notify_progress(current_progress, f"[pypdf] Processing '{filename}' [{i+1}/{total_files}]")
+                    
+                    # More detailed progress message
+                    self.notify_progress(
+                        current_progress, 
+                        f"Processing '{filename}' ({i+1}/{total_files}) - {self.total_pages_merged} pages merged so far"
+                    )
 
                     password = self.passwords.get(input_path)
-                    reader = None
+                    doc = None # Ensure doc is closable in finally
                     try:
-                        # Check if file was successfully processed by fitz (for outline consistency)
-                        # if input_path not in processed_file_paths:
-                        #    self.notify_status(f"Skipping '{filename}' as it failed in previous step.", "warning")
-                        #    continue
-
-                        # Open with pypdf
-                        reader = PdfReader(input_path)
-                        if reader.is_encrypted:
+                        # Open the current input PDF
+                        doc = fitz.open(input_path)
+                        if doc.is_encrypted:
                             if not password:
                                 self.notify_status(f"'{filename}' is encrypted, password needed. Skipping.", "warning")
-                                continue
-                            if not reader.decrypt(password):
+                                continue # Skip this file
+                            
+                            auth_result = doc.authenticate(password)
+                            if not auth_result:
                                 self.notify_status(f"Incorrect password for '{filename}'. Skipping.", "warning")
-                                continue
+                                continue # Skip this file
+                            # Log the type of access granted for debugging
+                            if auth_result > 2: # PyMuPDF 1.19+ returns 4 for owner, 2 for user
+                                logger.debug(f"Owner access granted for '{filename}'")
+                            elif auth_result > 1:
+                                logger.debug(f"User access granted for '{filename}'")
 
-                        num_pages = len(reader.pages)
+
+                        num_pages = doc.page_count
                         if num_pages > 0:
-                            # Add bookmark before appending
-                            bookmark = None
+                            # If adding outlines, note the page number *before* inserting
                             if self.outline_title_template:
+                                dest_page_idx = out_doc.page_count # 0-based index in output doc
                                 title = self._generate_bookmark_title(self.outline_title_template, i, filename)
-                                # `merger.append` adds bookmark automatically if `bookmark=True`
-                                # For custom title, use `add_outline_item` *after* append or manage manually.
-                                # Let's try simple merge first. We can add outlines manually later if needed.
-                                bookmark_title = title # Use generated title
+                                bookmarks_to_add.append((1, title, dest_page_idx + 1)) # fitz uses 1-based page for TOC
 
-                            # Append the file
-                            merger.append(reader, bookmark=bookmark_title) # Let pypdf handle basic bookmark
+                            # Show sub-progress for large documents
+                            if num_pages > 50:
+                                self.notify_status(f"Merging large document '{filename}' ({num_pages} pages)...", "info")
+
+                            # Insert the pages
+                            out_doc.insert_pdf(doc)
                             self.total_pages_merged += num_pages
                             files_processed += 1
+                            processed_file_paths.append(input_path) # Add to list for potential pypdf fallback outline
                         else:
                             self.notify_status(f"'{filename}' has no pages. Skipping.", "warning")
 
-                    except PdfReadError as e:
-                        self.notify_status(f"pypdf Error reading '{filename}': {e}. Skipping.", "warning")
-                    except PdfPasswordException as e: # Should be caught earlier, but just in case
-                         self.notify_status(f"Password error for '{filename}' with pypdf: {e}. Skipping.", "warning")
+                    except fitz.FileDataError as e:
+                        self.notify_status(f"Error reading '{filename}': Invalid format? Skipping. ({e})", "warning")
                     except Exception as e:
-                        self.notify_status(f"pypdf Error processing '{filename}': {e}. Skipping.", "warning")
-                    # reader is closed automatically by PdfMerger append
+                        self.notify_status(f"Error processing '{filename}': {e}. Skipping.", "warning")
+                        logger.exception(f"Unexpected error while processing '{filename}' for merge")
+                    finally:
+                        if doc:
+                            try:
+                                doc.close()
+                            except Exception as close_err:
+                                logger.warning(f"Error closing document '{filename}' during merge: {close_err}")
 
                 if files_processed == 0:
-                    merger.close()
-                    self.notify_status("No valid input PDF files processed by pypdf.", "error")
+                    out_doc.close() # Close the empty output doc
+                    self.notify_status("No valid input PDF files could be processed.", "error")
                     return False
 
-                # Write the merged PDF
-                self.notify_progress(95, f"Saving final merged PDF ({self.total_pages_merged} pages) using pypdf...")
+                # Add bookmarks if requested
+                if bookmarks_to_add:
+                    self.notify_status("Adding bookmarks...", "info")
+                    out_doc.set_toc(bookmarks_to_add)
+
+                # Save the merged document
+                self.notify_progress(95, f"Saving final merged PDF ({self.total_pages_merged} pages)...")
                 try:
-                    with open(self.output_path, "wb") as output_file:
-                        merger.write(output_file)
-                except Exception as write_err:
-                    self.notify_status(f"Error writing merged PDF with pypdf: {write_err}", "error")
+                    out_doc.save(self.output_path, garbage=4, deflate=True, linear=True)
+                except Exception as save_err:
+                    self.notify_status(f"Error saving merged PDF: {save_err}", "error")
                     return False
                 finally:
-                    merger.close()
+                    out_doc.close()
 
-                return True # pypdf fallback succeeded
+                return True # PyMuPDF method succeeded
 
             except OperationCancelledException:
                 raise
-            except Exception as pypdf_err:
-                self.notify_status(f"pypdf merge fallback also failed: {pypdf_err}", "error")
-                logger.error(f"pypdf merge failed: {pypdf_err}", exc_info=True)
-                return False # Both methods failed
+            except Exception as fitz_err:
+                self.notify_status(f"PyMuPDF merge failed ({fitz_err}), attempting fallback with pypdf...", "warning")
+                logger.warning(f"PyMuPDF merge failed: {fitz_err}", exc_info=False)
+
+                # --- Attempt 2: pypdf Fallback ---
+                merger = None  # Initialize to ensure it's closable in finally
+                try:
+                    self.notify_status("Using pypdf for merging (fallback)...", "info")
+                    merger = PdfMerger()
+                    self.total_pages_merged = 0 # Reset page count for pypdf
+                    files_processed = 0 # Reset count for pypdf
+
+                    for i, input_path in enumerate(self.input_paths):
+                        self.check_cancelled()
+                        current_progress = (i / (total_files + 1)) * 100
+                        filename = os.path.basename(input_path)
+                        self.notify_progress(current_progress, f"[pypdf] Processing '{filename}' [{i+1}/{total_files}]")
+
+                        password = self.passwords.get(input_path)
+                        try:
+                            # pypdf's PdfReader can be used as a context manager, but PdfMerger handles closing
+                            reader = PdfReader(input_path)
+                            if reader.is_encrypted:
+                                if not password:
+                                    self.notify_status(f"'{filename}' is encrypted, password needed. Skipping.", "warning")
+                                    continue
+                                if not reader.decrypt(password):
+                                    self.notify_status(f"Incorrect password for '{filename}'. Skipping.", "warning")
+                                    continue
+
+                            num_pages = len(reader.pages)
+                            if num_pages > 0:
+                                bookmark_title = None
+                                if self.outline_title_template:
+                                    title = self._generate_bookmark_title(self.outline_title_template, i, filename)
+                                    bookmark_title = title
+
+                                merger.append(reader, bookmark=bookmark_title)
+                                self.total_pages_merged += num_pages
+                                files_processed += 1
+                            else:
+                                self.notify_status(f"'{filename}' has no pages. Skipping.", "warning")
+
+                        except PdfReadError as e:
+                            self.notify_status(f"pypdf Error reading '{filename}': {e}. Skipping.", "warning")
+                        except Exception as e:
+                            self.notify_status(f"pypdf Error processing '{filename}': {e}. Skipping.", "warning")
+                            logger.exception(f"Unexpected error processing '{filename}' with pypdf")
+
+                    if files_processed == 0:
+                        self.notify_status("No valid input PDF files processed by pypdf.", "error")
+                        return False
+
+                    self.notify_progress(95, f"Saving final merged PDF ({self.total_pages_merged} pages) using pypdf...")
+                    try:
+                        with open(self.output_path, "wb") as output_file:
+                            merger.write(output_file)
+                    except Exception as write_err:
+                        self.notify_status(f"Error writing merged PDF with pypdf: {write_err}", "error")
+                        return False
+
+                    return True # pypdf fallback succeeded
+
+                except OperationCancelledException:
+                    raise
+                except Exception as pypdf_err:
+                    self.notify_status(f"pypdf merge fallback also failed: {pypdf_err}", "error")
+                    logger.error(f"pypdf merge failed: {pypdf_err}", exc_info=True)
+                    return False # Both methods failed
+                finally:
+                    if merger:
+                        try:
+                            merger.close()
+                        except Exception as close_err:
+                            logger.warning(f"Error closing pypdf merger: {close_err}")
 
     def _generate_bookmark_title(self, template: str, index: int, filename: str) -> str:
         """Generates bookmark title based on template."""
@@ -2041,53 +2191,41 @@ class RotatePDFOperation(PDFOperation):
         total_pages_to_process = len(pages_to_process)
 
         if total_pages_to_process == 0:
-             self.notify_status("No pages selected for rotation.", "warning")
-             return True
+            self.notify_status("No pages selected for rotation.", "warning")
+            return True
         if self.rotation == 0:
-             self.notify_status("Rotation angle is 0. No changes needed.", "info")
-             # Maybe copy file if output is different? For now, just succeed.
-             # Consider copying if input != output path?
-             if os.path.abspath(self.input_path) != os.path.abspath(self.output_path):
-                 try:
-                     shutil.copy2(self.input_path, self.output_path)
-                     self.notify_status("Input copied to output location as rotation was 0.", "info")
-                 except Exception as e:
-                     self.notify_status(f"Could not copy input to output for 0 rotation: {e}", "error")
-                     return False
-             return True
+            self.notify_status("Rotation angle is 0. No changes needed.", "info")
+            if os.path.abspath(self.input_path) != os.path.abspath(self.output_path):
+                try:
+                    shutil.copy2(self.input_path, self.output_path)
+                    self.notify_status("Input copied to output location as rotation was 0.", "info")
+                except Exception as e:
+                    self.notify_status(f"Could not copy input to output for 0 rotation: {e}", "error")
+                    return False
+            return True
 
         self.notify_status(f"Rotating {total_pages_to_process} page(s) by {self.rotation} degrees...", "info")
 
-        # --- Use PyMuPDF (fitz) ---
         try:
-            # Open the document
             with contextlib.closing(self._open_input_pdf_fitz()) as doc:
-                # Process each page specified
                 for i, page_idx in enumerate(pages_to_process):
                     self.check_cancelled()
                     self.notify_progress(
-                         (i / total_pages_to_process) * 100,
-                         f"Rotating page {page_idx+1} [{i+1}/{total_pages_to_process}]"
+                        (i / total_pages_to_process) * 100,
+                        f"Rotating page {page_idx+1} [{i+1}/{total_pages_to_process}]"
                     )
                     try:
-                        page = doc[page_idx] # Load page implicitly
+                        page = doc[page_idx]
+                        # PyMuPDF set_rotation takes ABSOLUTE rotation (0, 90, 180, 270)
+                        # We need to ADD our rotation to current rotation
                         current_rotation = page.rotation
-                        # Set *absolute* rotation, so add delta to current
-                        # new_rotation = (current_rotation + self.rotation) % 360
-                        # Note: fitz page.set_rotation seems to expect the DELTA. Let's test.
-                        # Documentation for page.set_rotation(deg) is sparse.
-                        # Let's assume it sets the *absolute* rotation.
-                        page.set_rotation(self.rotation) # Try setting absolute first
-                        # If that fails or behaves like delta, try:
-                        # page.set_rotation((page.rotation + self.rotation) % 360)
-
+                        new_rotation = (current_rotation + self.rotation) % 360
+                        page.set_rotation(new_rotation)
                     except Exception as page_err:
                         self.notify_status(f"Error rotating page {page_idx+1}: {page_err}", "warning")
 
-                # Save the document
                 self.notify_progress(95, "Saving rotated PDF...")
                 try:
-                     # Save incrementally if possible? No, save standard.
                     doc.save(self.output_path, garbage=4, deflate=True)
                 except Exception as save_err:
                     self.notify_status(f"Error saving rotated PDF: {save_err}", "error")
@@ -2098,21 +2236,20 @@ class RotatePDFOperation(PDFOperation):
 
         except OperationCancelledException:
             if os.path.exists(self.output_path):
-                 try: os.remove(self.output_path)
-                 except OSError: pass
+                try: os.remove(self.output_path)
+                except OSError: pass
             raise
         except (RuntimeError, ValidationError, PdfPasswordException) as e:
-             self.notify_status(f"Error during rotation: {e}", "error")
-             logger.error(f"Rotation failed pre-save: {e}", exc_info=False)
-             return False
+            self.notify_status(f"Error during rotation: {e}", "error")
+            logger.error(f"Rotation failed: {e}", exc_info=False)
+            return False
         except Exception as e:
             self.notify_status(f"Unexpected error during PDF rotation: {e}", "error")
             logger.exception("PDF rotation operation failed")
             if os.path.exists(self.output_path):
-                 try: os.remove(self.output_path)
-                 except OSError: pass
+                try: os.remove(self.output_path)
+                except OSError: pass
             return False
-
 
 class EditMetadataOperation(PDFOperation):
     """Operation to edit PDF document information (metadata)."""
@@ -2238,20 +2375,22 @@ class OperationManager:
             self._listeners.remove(listener)
 
     def _notify_listeners(self, method_name: str, *args, **kwargs):
-        """Helper to notify all registered listeners."""
-        # Operate on a copy in case listeners modify the list during iteration
-        listeners_copy = self._listeners[:]
-        for listener in listeners_copy:
-            if hasattr(listener, method_name):
-                try:
-                    # Schedule the call in the listener's thread context (e.g., GUI thread)
-                    # This requires the listener (UI) to handle thread safety.
-                    # A common way is using a queue or platform-specific event posting.
-                    # For tkinter, root.after(0, lambda: ...) or queue.put can work.
-                    # Assuming listeners handle their own threading context:
-                    getattr(listener, method_name)(*args, **kwargs)
-                except Exception as e:
-                    logger.error(f"Error notifying listener {listener}.{method_name}: {e}")
+            """Helper to notify all registered listeners, ensuring thread safety for GUI."""
+            # Operate on a copy in case listeners modify the list during iteration
+            listeners_copy = self._listeners[:]
+            for listener in listeners_copy:
+                if hasattr(listener, method_name):
+                    try:
+                        callback = getattr(listener, method_name)
+                        # Check if the listener is a GUI object with our safe update method
+                        if hasattr(listener, 'safe_ui_update') and callable(getattr(listener, 'safe_ui_update')):
+                            # Schedule the actual notification via the listener's safe_ui_update method
+                            listener.safe_ui_update(callback, operation, *args, **kwargs)
+                        else:
+                            # For non-GUI listeners or those without the method, call directly
+                            callback(operation, *args, **kwargs)
+                    except Exception as e:
+                        logger.error(f"Error notifying listener {listener}.{method_name}: {e}")
 
     def execute_operation(self, operation: PDFOperation):
         """
@@ -2335,16 +2474,18 @@ class OperationManager:
 
     def on_progress_update(self, operation: PDFOperation, progress: float, status_message: str, level: str):
         if operation == self.current_operation: # Ensure update is from current op
-            self._notify_listeners("on_progress_update", operation, progress, status_message, level)
+            self._notify_listeners("on_progress_update", progress, status_message, level)
+
 
     def on_status_update(self, operation: PDFOperation, message: str, level: str):
         if operation == self.current_operation:
-            self._notify_listeners("on_status_update", operation, message, level)
+            self._notify_listeners("on_status_update", message, level)
 
     def on_operation_complete(self, operation: PDFOperation, success: bool, message: str, level: str):
          # This notification comes *from* the operation upon its completion.
          # The _run_operation_thread handles the manager's final state cleanup.
-        self._notify_listeners("on_operation_complete", operation, success, message, level)
+        self._notify_listeners("on_operation_complete", success, message, level)
+
 
 
 class ConfigManager:
@@ -3338,7 +3479,52 @@ class AdvancedPdfToolkit:
         button.pack(pady=5) # Let pack handle centering within the container
         return button
 
-    # --- Individual Page Creation Methods ---
+    def sanitize_filename(self, filename: str, max_length: int = 255) -> str:
+            """
+            Sanitize a string to be a valid filename.
+
+            - Removes invalid characters for Windows, macOS, and Linux.
+            - Replaces them with an underscore.
+            - Strips leading/trailing whitespace and dots.
+            - Truncates the filename to a safe maximum length.
+            - Ensures the filename is not empty.
+            """
+            # Remove or replace invalid characters (comprehensive list)
+            invalid_chars = r'[<>:"/\\|?*\x00-\x1f]'
+            sanitized = re.sub(invalid_chars, '_', filename)
+            
+            # On Windows, some names are reserved, even without extensions
+            # This is a basic check; a full check is more complex.
+            reserved_names = {
+                "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
+                "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2",
+                "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+            }
+            name_part, _ = os.path.splitext(sanitized)
+            if name_part.upper() in reserved_names:
+                sanitized = f"_{sanitized}"
+
+            # Remove leading/trailing spaces and dots, which can be problematic
+            sanitized = sanitized.strip('. ')
+            
+            # Limit overall length to avoid filesystem errors
+            # We consider the bytes length for cross-platform safety
+            byte_string = sanitized.encode('utf-8', 'ignore')
+            if len(byte_string) > max_length:
+                # Truncate based on bytes, then decode back safely
+                truncated_bytes = byte_string[:max_length]
+                sanitized = truncated_bytes.decode('utf-8', 'ignore')
+                # It's possible the truncation broke a multi-byte character,
+                # so let's re-check the end of the string
+                base, ext = os.path.splitext(sanitized)
+                sanitized = base.rstrip(' _-.') + ext
+            
+            # Ensure it's not empty after all the cleaning
+            if not sanitized:
+                return "output_" + str(uuid.uuid4())[:8] # Return a unique name
+            
+            return sanitized
+        # --- Individual Page Creation Methods ---
 
     def _create_split_page(self, parent: ttk.Frame):
         logger.debug("Creating Split page...")
@@ -4033,7 +4219,25 @@ class AdvancedPdfToolkit:
 
     # --- UI Helper Methods ---
     # (File Dialogs, Listbox Manipulation, Tooltips, etc.)
-
+    def safe_ui_update(self, callback: Callable, *args, **kwargs):
+            """
+            Safely schedules a function to be called in the main GUI thread.
+            This prevents race conditions and errors when updating UI from background threads.
+            """
+            if not self.root:
+                return # Root window has been destroyed
+            try:
+                # root.after(0, ...) schedules the callback to run as soon as possible
+                # in the Tkinter event loop.
+                self.root.after(0, partial(callback, *args, **kwargs))
+            except tk.TclError as e:
+                # This can happen if the application is shutting down and the
+                # main window has already been destroyed.
+                if "invalid command name" in str(e):
+                    logger.warning("Could not schedule UI update: main window is likely destroyed.")
+                else:
+                    raise # Re-raise other TclErrors
+                    
     def add_tooltip(self, widget: tk.Widget, text: str):
         """Basic tooltip implementation (can be replaced with a library)."""
         tooltip_label = None
