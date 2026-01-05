@@ -596,53 +596,60 @@ class PDFOperation:
         raise NotImplementedError("Each operation must implement the 'execute' method.")
 
     def run(self) -> Any:
-        """
-        Executes the operation lifecycle: validation, execution, notification.
-        Returns the result of the execute method or None on failure/cancellation.
-        """
-        result = None
-        self._running = True
-        self._cancelled = False
-        self._progress = 0.0
-        start_time = time.monotonic()
-        self.notify_progress(0, f"Starting {self.name}...", "info")
+            """
+            Executes the operation lifecycle: validation, execution, notification.
+            Returns the result of the execute method or None on failure/cancellation.
+            """
+            result = None
+            self._running = True
+            self._cancelled = False
+            self._progress = 0.0
+            start_time = time.monotonic()
+            self.notify_progress(0, f"Starting {self.name}...", "info")
 
-        try:
-            # 1. Validation
-            self.notify_status("Validating parameters...", "info")
-            self._validate_paths() # Common path validation
-            self.validate()       # Operation-specific validation
-            self.check_cancelled()
+            try:
+                # 1. Validation
+                self.notify_status("Validating parameters...", "info")
+                self._validate_paths() # Common path validation
+                self.validate()       # Operation-specific validation
+                self.check_cancelled()
 
-            # 2. Execution
-            self.notify_status("Executing operation...", "info")
-            result = self.execute()
-            self.check_cancelled() # Check again after main execution block
+                # 2. Execution
+                self.notify_status("Executing operation...", "info")
+                result = self.execute()
+                self.check_cancelled() # Check again after main execution block
 
-            # 3. Completion (Success)
-            self._progress = 100.0
-            elapsed_time = time.monotonic() - start_time
-            success_msg = f"{self.name} completed successfully in {elapsed_time:.2f} seconds."
-            self.notify_progress(100, success_msg, "success")
-            self.notify_completion(True, success_msg, "success")
-            return result
+                # --- FIX: Check if the operation logic returned False indicating failure ---
+                if result is False:
+                    # The operation likely already notified a specific error status, 
+                    # but we must ensure the final completion event reflects failure.
+                    self.notify_completion(False, f"{self.name} failed.", "error")
+                    return result
+                # -------------------------------------------------------------------------
 
-        except (ValidationError, PdfPasswordException, OperationCancelledException) as e:
-            level = "warning" if isinstance(e, (OperationCancelledException, PdfPasswordException)) else "error"
-            logger.log(logging.WARNING if level=="warning" else logging.ERROR, f"{self.name} failed: {e}")
-            self.notify_completion(False, f"{self.name} failed: {e}", level)
-            return None
-        except Exception as e:
-            error_msg = f"Unexpected error during {self.name}: {e}"
-            logger.exception(error_msg) # Log full traceback
-            self.notify_status(error_msg, "error") # Show error in status bar
-            self.notify_completion(False, error_msg, "error")
-            return None
-        finally:
-            self._running = False
-            self._cancelled = False # Reset cancellation flag
+                # 3. Completion (Success)
+                self._progress = 100.0
+                elapsed_time = time.monotonic() - start_time
+                success_msg = f"{self.name} completed successfully in {elapsed_time:.2f} seconds."
+                self.notify_progress(100, success_msg, "success")
+                self.notify_completion(True, success_msg, "success")
+                return result
 
-
+            except (ValidationError, PdfPasswordException, OperationCancelledException) as e:
+                level = "warning" if isinstance(e, (OperationCancelledException, PdfPasswordException)) else "error"
+                logger.log(logging.WARNING if level=="warning" else logging.ERROR, f"{self.name} failed: {e}")
+                self.notify_completion(False, f"{self.name} failed: {e}", level)
+                return None
+            except Exception as e:
+                error_msg = f"Unexpected error during {self.name}: {e}"
+                logger.exception(error_msg) # Log full traceback
+                self.notify_status(error_msg, "error") # Show error in status bar
+                self.notify_completion(False, error_msg, "error")
+                return None
+            finally:
+                self._running = False
+                self._cancelled = False # Reset cancellation flag
+                
 class SplitPDFOperation(PDFOperation):
     """Operation to split a PDF into multiple files."""
     def __init__(self, input_path: str, output_dir: str,
@@ -1081,7 +1088,7 @@ class MergePDFOperation(PDFOperation):
                 # Save the merged document
                 self.notify_progress(95, f"Saving final merged PDF ({self.total_pages_merged} pages)...")
                 try:
-                    out_doc.save(self.output_path, garbage=4, deflate=True, linear=True)
+                    out_doc.save(self.output_path, garbage=4, deflate=True)
                 except Exception as save_err:
                     self.notify_status(f"Error saving merged PDF: {save_err}", "error")
                     return False
@@ -1656,7 +1663,6 @@ class CompressPDFOperation(PDFOperation):
                      "deflate_images": True, # Compress image streams
                      "deflate_fonts": True,  # Compress font streams
                      "clean": True,      # Clean content streams (remove redundancy)
-                     "linear": True,     # Linearize for web view (optional, might increase size slightly)
                      "pretty": False,    # No pretty printing for smaller size
                      # Note: PyMuPDF doesn't have a direct 'quality' setting like Ghostscript.
                      # Compression effectiveness depends on content and the options above.
@@ -1956,7 +1962,6 @@ class EncryptPDFOperation(PDFOperation):
             save_options = {
                 "garbage": 4,
                 "deflate": True,
-                "linear": False, # Linearization might interfere?
             }
 
             if self.action == "encrypt":
@@ -3414,40 +3419,50 @@ class AdvancedPdfToolkit:
         return frame, widget
 
     def _create_io_section(self, parent: ttk.Frame, input_var: tk.StringVar, output_var: tk.StringVar,
-                       input_label: str="Input File:", output_label: str="Output Location:",
-                       input_type: str="pdf", # pdf, image, images, any
-                       output_type: str="dir", # dir, pdf, txt
-                       input_cmd: Optional[Callable]=None, output_cmd: Optional[Callable]=None):
-        """Helper to create standard Input/Output file/dir selection rows."""
-        # --- Input Row ---
-        if input_cmd is None:
-            if input_type == "images": # Special case for multi-file select
-                input_cmd = lambda: self.select_input_files_generic() # Needs context which listbox/var
+                           input_label: str="Input File:", output_label: str="Output Location:",
+                           input_type: str="pdf", # pdf, image, images, any
+                           output_type: str="dir", # dir, pdf, txt
+                           input_cmd: Optional[Callable]=None, output_cmd: Optional[Callable]=None):
+            """Helper to create standard Input/Output file/dir selection rows."""
+            
+            # --- Input Row ---
+            # --- FIX: handle case where input_var is None (e.g. Merge/Img2PDF tabs) ---
+            if input_var is None:
+                input_widget_type = 'label'
+                effective_input_cmd = None
             else:
-                 input_cmd = lambda: self.select_input_file(input_var, input_type)
+                input_widget_type = 'readonly_entry' if input_type != "images" else 'label'
+                
+                if input_cmd is None:
+                    if input_type == "images": # Special case for multi-file select
+                        effective_input_cmd = lambda: self.select_input_files_generic() 
+                    else:
+                        effective_input_cmd = lambda: self.select_input_file(input_var, input_type)
+                else:
+                    effective_input_cmd = input_cmd
 
-        input_widget_type = 'readonly_entry' if input_type != "images" else 'label' # Don't use entry for multi-image
+            if input_widget_type == 'label':
+                # Handle multi-input display or None var
+                text_val = '(Use Add button below)' if input_type == "images" else ''
+                self._create_widget_row(parent, input_label, None, 'label', 
+                                        widget_options={'text': text_val})
+            else:
+                 _, entry = self._create_widget_row(parent, input_label, input_var, input_widget_type,
+                                               button_text="Browse...", button_cmd=effective_input_cmd)
+                 if entry: entry.configure(style='PathEntry.TEntry')
+            # --------------------------------------------------------------------------
 
-        if input_widget_type == 'label':
-            # Handle multi-input display (e.g., listbox elsewhere)
-             self._create_widget_row(parent, input_label, None, 'label', # Just the label
-                                    widget_options={'text': '(Use Add button below)'})
-        else:
-             _, entry = self._create_widget_row(parent, input_label, input_var, input_widget_type,
-                                           button_text="Browse...", button_cmd=input_cmd)
-             if entry: entry.configure(style='PathEntry.TEntry')
+            # --- Output Row ---
+            if output_cmd is None:
+                if output_type == "dir":
+                    output_cmd = lambda: self.select_output_dir(output_var)
+                else: # Assume file
+                    output_cmd = lambda: self.select_output_file(output_var, output_type)
 
-        # --- Output Row ---
-        if output_cmd is None:
-            if output_type == "dir":
-                output_cmd = lambda: self.select_output_dir(output_var)
-            else: # Assume file
-                output_cmd = lambda: self.select_output_file(output_var, output_type)
-
-        _, entry = self._create_widget_row(parent, output_label, output_var, 'readonly_entry',
-                                       button_text="Browse...", button_cmd=output_cmd)
-        if entry: entry.configure(style='PathEntry.TEntry')
-
+            _, entry = self._create_widget_row(parent, output_label, output_var, 'readonly_entry',
+                                           button_text="Browse...", button_cmd=output_cmd)
+            if entry: entry.configure(style='PathEntry.TEntry')
+        
     def _create_password_field(self, parent: ttk.Frame, variable: tk.StringVar,
                               label: str = "Password (if any):") -> Tuple[ttk.Frame, ttk.Entry]:
         """Helper to create a password input field row."""
@@ -4288,27 +4303,32 @@ class AdvancedPdfToolkit:
         widget.bind('<ButtonPress>', _hide_tooltip, add='+') # Hide on click
 
     def select_input_file(self, variable: tk.StringVar, file_type: str):
-        """Open file dialog to select a single input file."""
-        type_map = {
-            "pdf": [("PDF Files", "*.pdf"), ("All Files", "*.*")],
-            "image": [("Image Files", " ".join(f"*{ext}" for ext in SUPPORTED_IMAGE_FORMATS)), ("All Files", "*.*")],
-            "any": [("All Files", "*.*")]
-        }
-        filetypes = type_map.get(file_type, [("All Files", "*.*")])
-        title = f"Select Input {file_type.capitalize()} File"
+            """Open file dialog to select a single input file."""
+            # --- FIX: Guard against None variable ---
+            if variable is None:
+                return
+            # ----------------------------------------
 
-        initial_dir = os.path.dirname(variable.get()) if variable.get() else self.config_manager.get("paths", "default_output_dir") or os.path.expanduser("~")
+            type_map = {
+                "pdf": [("PDF Files", "*.pdf"), ("All Files", "*.*")],
+                "image": [("Image Files", " ".join(f"*{ext}" for ext in SUPPORTED_IMAGE_FORMATS)), ("All Files", "*.*")],
+                "any": [("All Files", "*.*")]
+            }
+            filetypes = type_map.get(file_type, [("All Files", "*.*")])
+            title = f"Select Input {file_type.capitalize()} File"
 
-        filepath = filedialog.askopenfilename(title=title, filetypes=filetypes, initialdir=initial_dir, parent=self.root)
+            initial_dir = os.path.dirname(variable.get()) if variable.get() else self.config_manager.get("paths", "default_output_dir") or os.path.expanduser("~")
 
-        if filepath:
-            variable.set(filepath)
-            # Add to recent files (triggers auto-fill output via trace)
-            self.recent_files_manager.add_recent_file(filepath)
-            # Store last used directory?
-            self.config_manager.set("paths", "default_output_dir", os.path.dirname(filepath))
-            # No need to save config here, happens on variable trace or exit
+            filepath = filedialog.askopenfilename(title=title, filetypes=filetypes, initialdir=initial_dir, parent=self.root)
 
+            if filepath:
+                variable.set(filepath)
+                # Add to recent files (triggers auto-fill output via trace)
+                self.recent_files_manager.add_recent_file(filepath)
+                # Store last used directory?
+                self.config_manager.set("paths", "default_output_dir", os.path.dirname(filepath))
+                # No need to save config here, happens on variable trace or exit
+                
     def select_input_files_generic(self):
          """Determine which multi-file input to trigger based on current tab."""
          current_tab_index = self.notebook.index(self.notebook.select())
@@ -4329,24 +4349,28 @@ class AdvancedPdfToolkit:
             self.config_manager.set("paths", "default_output_dir", dirpath)
 
     def select_output_file(self, variable: tk.StringVar, file_type: str):
-        """Open file dialog to select an output file path."""
-        type_map = {
-            "pdf": ([("PDF Files", "*.pdf"), ("All Files", "*.*")], ".pdf"),
-            "txt": ([("Text Files", "*.txt"), ("All Files", "*.*")], ".txt"),
-            # Add other types if needed
-        }
-        filetypes, defaultextension = type_map.get(file_type, ([("All Files", "*.*")], ""))
+            """Open file dialog to select an output file path."""
+            # --- FIX: Guard against None variable ---
+            if variable is None:
+                return
+            # ----------------------------------------
 
-        initial_dir = os.path.dirname(variable.get()) if variable.get() else self.config_manager.get("paths", "default_output_dir") or os.path.expanduser("~")
-        initial_file = os.path.basename(variable.get()) if variable.get() else ""
+            type_map = {
+                "pdf": ([("PDF Files", "*.pdf"), ("All Files", "*.*")], ".pdf"),
+                "txt": ([("Text Files", "*.txt"), ("All Files", "*.*")], ".txt"),
+                # Add other types if needed
+            }
+            filetypes, defaultextension = type_map.get(file_type, ([("All Files", "*.*")], ""))
 
-        filepath = filedialog.asksaveasfilename(title="Select Output File", filetypes=filetypes,
-                                                defaultextension=defaultextension, initialdir=initial_dir,
-                                                initialfile=initial_file, parent=self.root)
-        if filepath:
-            variable.set(filepath)
-            self.config_manager.set("paths", "default_output_dir", os.path.dirname(filepath))
+            initial_dir = os.path.dirname(variable.get()) if variable.get() else self.config_manager.get("paths", "default_output_dir") or os.path.expanduser("~")
+            initial_file = os.path.basename(variable.get()) if variable.get() else ""
 
+            filepath = filedialog.asksaveasfilename(title="Select Output File", filetypes=filetypes,
+                                                    defaultextension=defaultextension, initialdir=initial_dir,
+                                                    initialfile=initial_file, parent=self.root)
+            if filepath:
+                variable.set(filepath)
+                self.config_manager.set("paths", "default_output_dir", os.path.dirname(filepath))
 
     def select_input_file_generic(self, file_type: str):
         """Generic file open triggered from menu or toolbar."""
@@ -5142,42 +5166,54 @@ class AdvancedPdfToolkit:
 
 
     def _set_ui_state(self, enabled: bool):
-        """Enable or disable main action buttons and potentially other inputs."""
-        logger.debug(f"Setting UI state to enabled={enabled}")
-        state = tk.NORMAL if enabled else tk.DISABLED
-        # Find the main action button on the current tab and disable/enable it
-        try:
-             current_tab_frame = self.notebook.nametowidget(self.notebook.select())
-             # Find the button typically created by _create_action_button
-             action_button = None
-             # Look for a button with a primary style or specific text? Risky.
-             # Let's assume it's the last button added directly to the tab frame's children
-             # (or its container's children if packed in a subframe).
-             # This needs a more robust way, e.g., storing references.
-             for child in reversed(current_tab_frame.winfo_children()):
-                 if isinstance(child, ttk.Frame): # Check container frame first
-                     for btn_child in reversed(child.winfo_children()):
-                         if isinstance(btn_child, ttk.Button) and ('primary' in btn_child.cget('style') or 'Action' in btn_child.cget('text')):
-                             action_button = btn_child
-                             break
-                 elif isinstance(child, ttk.Button) and ('primary' in child.cget('style') or 'Action' in child.cget('text')):
-                     action_button = child
-                 if action_button: break
+            """Enable or disable main action buttons recursively."""
+            # logger.debug(f"Setting UI state to enabled={enabled}")
+            state = tk.NORMAL if enabled else tk.DISABLED
+            
+            try:
+                # Get the widget object for the currently selected tab
+                current_tab_id = self.notebook.select()
+                if not current_tab_id: return
+                current_tab_frame = self.notebook.nametowidget(current_tab_id)
 
-             if action_button:
-                 logger.debug(f"Found action button: {action_button.cget('text')}")
-                 action_button.config(state=state)
-             else:
-                  logger.warning("Could not find action button on current tab to change state.")
+                # Recursive helper to find the button
+                def _find_primary_button(container):
+                    # Search in reverse order (buttons are usually packed last/at bottom)
+                    children = container.winfo_children()
+                    for child in reversed(children):
+                        # Check if it is a Button
+                        if isinstance(child, ttk.Button):
+                            try:
+                                style = str(child.cget('style')).lower()
+                                # Identify the main action button by its style ('primary', 'success', etc.)
+                                # and ensure it's not an 'outline' button (used for small tools like Add/Remove)
+                                if ('primary' in style or 'success' in style or 'danger' in style) and 'outline' not in style:
+                                    return child
+                            except tk.TclError:
+                                pass
+                        
+                        # Recurse into container widgets (Frame, LabelFrame, PanedWindow)
+                        if isinstance(child, (ttk.Frame, ttk.LabelFrame, ttk.PanedWindow, 
+                                              tk.Frame, tk.LabelFrame, tk.PanedWindow)):
+                            found = _find_primary_button(child)
+                            if found:
+                                return found
+                    return None
 
-             # Optionally disable/enable other inputs like file lists, options? Could be too broad.
-             # For now, just disable the main action button.
+                # Execute search
+                action_button = _find_primary_button(current_tab_frame)
 
-        except tk.TclError:
-             logger.warning("Could not get current tab frame to set UI state.")
-        except Exception as e:
-             logger.error(f"Error setting UI state: {e}")
+                if action_button:
+                    action_button.config(state=state)
+                else:
+                    # If we still can't find it (unlikely with recursion), just log debug
+                    logger.debug("UI State: Action button not found for auto-disable.")
 
+            except tk.TclError:
+                 pass # Can happen during app shutdown or rapid tab switching
+            except Exception as e:
+                 logger.error(f"Error setting UI state: {e}")
+                 
 
     def add_status_message(self, message: str, level: str = "info"):
         """Adds message to status bar, history, and logs."""
